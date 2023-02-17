@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 """
 Count the number of documents and average number of lines and tokens per
 document in a large file. Documents should be separated by a single empty line.
@@ -12,7 +10,6 @@ document in a large file. Documents should be separated by a single empty line.
 
 import argparse
 import gzip
-import random
 import sys
 
 import numpy as np
@@ -20,15 +17,15 @@ import numpy as np
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('input')
-    parser.add_argument('--gzip', action='store_true')
+    parser.add_argument("input")
+    parser.add_argument("--gzip", action="store_true")
     args = parser.parse_args()
 
     def gopen():
         if args.gzip:
-            return gzip.open(args.input, 'r')
+            return gzip.open(args.input, "r")
         else:
-            return open(args.input, 'r', encoding='utf-8')
+            return open(args.input, "r", encoding="utf-8")
 
     num_lines = []
     num_toks = []
@@ -57,5 +54,5 @@ def main():
     print("average num toks per doc: {}".format(np.mean(num_toks)))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

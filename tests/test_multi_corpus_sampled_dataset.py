@@ -1,9 +1,7 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 import unittest
 from collections import OrderedDict
@@ -81,7 +79,7 @@ class TestMultiCorpusSampledDataset(unittest.TestCase):
 
     def test_multi_corpus_sampled_dataset_weighted_sample(self):
         def naive_weighted_sample(weights):
-            def f(l):
+            def f(input):
                 v = np.random.random()
                 agg = 0
                 for i, weight in enumerate(weights):

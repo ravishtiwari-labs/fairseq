@@ -1,140 +1,327 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the license found in the LICENSE file in
-# the root directory of this source tree. An additional grant of patent rights
-# can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
-import itertools
-import numpy as np
+import logging
 import os
+from dataclasses import dataclass, field
 
-from fairseq import tokenizer
+import numpy as np
+from omegaconf import II, MISSING, OmegaConf
+
+from fairseq import utils
 from fairseq.data import (
-    ConcatDataset,
-    indexed_dataset,
+    Dictionary,
+    IdDataset,
+    MaskTokensDataset,
+    NestedDictionaryDataset,
+    NumelDataset,
+    NumSamplesDataset,
+    PrependTokenDataset,
+    RightPadDataset,
+    RightPaddingMaskDataset,
+    SortDataset,
+    TokenBlockDataset,
     data_utils,
 )
+from fairseq.data.encoders.utils import get_whole_word_mask
+from fairseq.data.shorten_dataset import maybe_shorten_dataset
+from fairseq.dataclass import FairseqDataclass
+from fairseq.tasks import FairseqTask, register_task
 
-from fairseq.data import Dictionary
-from fairseq.data.block_pair_dataset import BlockPairDataset
-from fairseq.data.masked_lm_dataset import MaskedLMDataset
-from fairseq.data.masked_lm_dictionary import BertDictionary
+from .language_modeling import SAMPLE_BREAK_MODE_CHOICES, SHORTEN_METHOD_CHOICES
 
-from . import FairseqTask, register_task
+logger = logging.getLogger(__name__)
 
 
-@register_task('masked_lm')
+@dataclass
+class MaskedLMConfig(FairseqDataclass):
+    data: str = field(
+        default=MISSING,
+        metadata={
+            "help": "colon separated path to data directories list, \
+                            will be iterated upon during epochs in round-robin manner"
+        },
+    )
+    sample_break_mode: SAMPLE_BREAK_MODE_CHOICES = field(
+        default="none",
+        metadata={
+            "help": 'If omitted or "none", fills each sample with tokens-per-sample '
+            'tokens. If set to "complete", splits samples only at the end '
+            "of sentence, but may include multiple sentences per sample. "
+            '"complete_doc" is similar but respects doc boundaries. '
+            'If set to "eos", includes only one sentence per sample.'
+        },
+    )
+    tokens_per_sample: int = field(
+        default=1024,
+        metadata={"help": "max number of tokens per sample for LM dataset"},
+    )
+    mask_prob: float = field(
+        default=0.15,
+        metadata={"help": "probability of replacing a token with mask"},
+    )
+    leave_unmasked_prob: float = field(
+        default=0.1,
+        metadata={"help": "probability that a masked token is unmasked"},
+    )
+    random_token_prob: float = field(
+        default=0.1,
+        metadata={"help": "probability of replacing a token with a random token"},
+    )
+    freq_weighted_replacement: bool = field(
+        default=False,
+        metadata={"help": "sample random replacement words based on word frequencies"},
+    )
+    mask_whole_words: bool = field(
+        default=False,
+        metadata={"help": "mask whole words; you may also want to set --bpe"},
+    )
+    mask_multiple_length: int = field(
+        default=1,
+        metadata={"help": "repeat the mask indices multiple times"},
+    )
+    mask_stdev: float = field(
+        default=0.0,
+        metadata={"help": "stdev of the mask length"},
+    )
+    shorten_method: SHORTEN_METHOD_CHOICES = field(
+        default="none",
+        metadata={
+            "help": "if not none, shorten sequences that exceed --tokens-per-sample"
+        },
+    )
+    shorten_data_split_list: str = field(
+        default="",
+        metadata={
+            "help": "comma-separated list of dataset splits to apply shortening to, "
+            'e.g., "train,valid" (default: all dataset splits)'
+        },
+    )
+    seed: int = II("common.seed")
+
+    include_target_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "include target tokens in model input. this is used for data2vec"
+        },
+    )
+    include_index: bool = field(
+        default=True,
+        metadata={"help": "include index in model input. this is used for data2vec"},
+    )
+    skip_masking: bool = field(
+        default=False,
+        metadata={"help": "skip masking at dataset"},
+    )
+    # subsample_train: float = field(
+    #     default=1,
+    #     metadata={"help": "shorten training set for debugging"},
+    # )
+    d2v2_multi: bool = field(
+        default=False,
+        metadata={"help": "prepare dataset for data2vec_multi"},
+    )
+
+
+@register_task("masked_lm", dataclass=MaskedLMConfig)
 class MaskedLMTask(FairseqTask):
-    """
-    Task for training Masked LM (BERT) model.
-    Args:
-        dictionary (Dictionary): the dictionary for the input of the task
-    """
 
-    @staticmethod
-    def add_args(parser):
-        """Add task-specific arguments to the parser."""
-        parser.add_argument('data', help='colon separated path to data directories list, \
-                            will be iterated upon during epochs in round-robin manner')
-        parser.add_argument('--tokens-per-sample', default=512, type=int,
-                            help='max number of total tokens over all segments'
-                                 ' per sample for BERT dataset')
-        parser.add_argument('--break-mode', default="doc", type=str, help='mode for breaking sentence')
-        parser.add_argument('--shuffle-dataset', action='store_true', default=False)
+    cfg: MaskedLMConfig
 
-    def __init__(self, args, dictionary):
-        super().__init__(args)
-        self.dictionary = dictionary
-        self.seed = args.seed
+    """Task for training masked language models (e.g., BERT, RoBERTa)."""
+
+    def __init__(self, cfg: MaskedLMConfig, dictionary=None):
+        super().__init__(cfg)
+        self.dictionary = dictionary or self.load_dict(cfg)
+
+        # add mask token
+        self.mask_idx = self.dictionary.add_symbol("<mask>")
 
     @classmethod
-    def load_dictionary(cls, filename):
-        return BertDictionary.load(filename)
+    def setup_task(cls, cfg: MaskedLMConfig, **kwargs):
+        dictionary = cls.load_dict(cfg)
+        return cls(cfg, dictionary)
 
     @classmethod
-    def build_dictionary(cls, filenames, workers=1, threshold=-1, nwords=-1, padding_factor=8):
-        d = BertDictionary()
-        for filename in filenames:
-            Dictionary.add_file_to_dictionary(filename, d, tokenizer.tokenize_line, workers)
-        d.finalize(threshold=threshold, nwords=nwords, padding_factor=padding_factor)
-        return d
+    def load_dict(cls, cfg):
+        paths = utils.split_paths(cfg.data)
+        assert len(paths) > 0
+        dictionary = Dictionary.load(os.path.join(paths[0], "dict.txt"))
+        logger.info("dictionary: {} types".format(len(dictionary)))
+        return dictionary
+
+    def _load_dataset_split(self, split, epoch, combine):
+        paths = utils.split_paths(self.cfg.data)
+        assert len(paths) > 0
+        data_path = paths[(epoch - 1) % len(paths)]
+        split_path = os.path.join(data_path, split)
+
+        dataset = data_utils.load_indexed_dataset(
+            split_path,
+            self.source_dictionary,
+            combine=combine,
+        )
+        if dataset is None:
+            raise FileNotFoundError(
+                "Dataset not found: {} ({})".format(split, split_path)
+            )
+
+        dataset = maybe_shorten_dataset(
+            dataset,
+            split,
+            self.cfg.shorten_data_split_list,
+            self.cfg.shorten_method,
+            self.cfg.tokens_per_sample,
+            self.cfg.seed,
+        )
+
+        # create continuous blocks of tokens
+        dataset = TokenBlockDataset(
+            dataset,
+            dataset.sizes,
+            self.cfg.tokens_per_sample - 1,  # one less for <s>
+            pad=self.source_dictionary.pad(),
+            eos=self.source_dictionary.eos(),
+            break_mode=self.cfg.sample_break_mode,
+        )
+        logger.info("loaded {} blocks from: {}".format(len(dataset), split_path))
+
+        # prepend beginning-of-sentence token (<s>, equiv. to [CLS] in BERT)
+        return PrependTokenDataset(dataset, self.source_dictionary.bos())
+
+    def load_dataset(self, split, epoch=1, combine=False, **kwargs):
+        """Load a given dataset split.
+
+        Args:
+            split (str): name of the split (e.g., train, valid, test)
+        """
+        dataset = self._load_dataset_split(split, epoch, combine)
+
+        # create masked input and targets
+        mask_whole_words = (
+            get_whole_word_mask(self.args, self.source_dictionary)
+            if self.cfg.mask_whole_words
+            else None
+        )
+
+        src_dataset, tgt_dataset = MaskTokensDataset.apply_mask(
+            dataset,
+            self.source_dictionary,
+            pad_idx=self.source_dictionary.pad(),
+            mask_idx=self.mask_idx,
+            seed=self.cfg.seed,
+            mask_prob=self.cfg.mask_prob,
+            leave_unmasked_prob=self.cfg.leave_unmasked_prob,
+            random_token_prob=self.cfg.random_token_prob,
+            freq_weighted_replacement=self.cfg.freq_weighted_replacement,
+            mask_whole_words=mask_whole_words,
+            mask_multiple_length=self.cfg.mask_multiple_length,
+            mask_stdev=self.cfg.mask_stdev,
+            skip_masking=self.cfg.skip_masking,
+        )
+
+        with data_utils.numpy_seed(self.cfg.seed):
+            shuffle = np.random.permutation(len(src_dataset))
+
+        target_dataset = RightPadDataset(
+            tgt_dataset,
+            pad_idx=self.source_dictionary.pad(),
+        )
+
+        if self.cfg.d2v2_multi:
+            dataset = self._d2v2_multi_dataset(src_dataset)
+        else:
+            dataset = self._regular_dataset(src_dataset, target_dataset)
+
+        self.datasets[split] = SortDataset(
+            dataset, sort_order=[shuffle, src_dataset.sizes]
+        )
+
+    def _regular_dataset(self, src_dataset, target_dataset):
+        input_dict = {
+            "src_tokens": RightPadDataset(
+                src_dataset,
+                pad_idx=self.source_dictionary.pad(),
+            ),
+            "src_lengths": NumelDataset(src_dataset, reduce=False),
+        }
+        if self.cfg.include_target_tokens:
+            input_dict["target_tokens"] = target_dataset
+        if self.cfg.include_index:
+            input_dict["src_id"] = IdDataset()
+
+        dataset = NestedDictionaryDataset(
+            {
+                "id": IdDataset(),
+                "net_input": input_dict,
+                "target": target_dataset,
+                "nsentences": NumSamplesDataset(),
+                "ntokens": NumelDataset(src_dataset, reduce=True),
+            },
+            sizes=[src_dataset.sizes],
+        )
+        return dataset
+
+    def _d2v2_multi_dataset(self, src_dataset):
+        input_dict = {
+            "source": RightPadDataset(
+                src_dataset,
+                pad_idx=self.source_dictionary.pad(),
+            ),
+            "id": IdDataset(),
+            "padding_mask": RightPaddingMaskDataset(src_dataset),
+        }
+
+        dataset = NestedDictionaryDataset(
+            {
+                "id": IdDataset(),
+                "net_input": input_dict,
+                "nsentences": NumSamplesDataset(),
+                "ntokens": NumelDataset(src_dataset, reduce=True),
+            },
+            sizes=[src_dataset.sizes],
+        )
+        return dataset
+
+    def build_dataset_for_inference(self, src_tokens, src_lengths, sort=True):
+        src_dataset = RightPadDataset(
+            TokenBlockDataset(
+                src_tokens,
+                src_lengths,
+                self.cfg.tokens_per_sample - 1,  # one less for <s>
+                pad=self.source_dictionary.pad(),
+                eos=self.source_dictionary.eos(),
+                break_mode="eos",
+            ),
+            pad_idx=self.source_dictionary.pad(),
+        )
+        src_dataset = PrependTokenDataset(src_dataset, self.source_dictionary.bos())
+        src_dataset = NestedDictionaryDataset(
+            {
+                "id": IdDataset(),
+                "net_input": {
+                    "src_tokens": src_dataset,
+                    "src_lengths": NumelDataset(src_dataset, reduce=False),
+                },
+            },
+            sizes=src_lengths,
+        )
+        if sort:
+            src_dataset = SortDataset(src_dataset, sort_order=[src_lengths])
+        return src_dataset
+
+    @property
+    def source_dictionary(self):
+        return self.dictionary
 
     @property
     def target_dictionary(self):
         return self.dictionary
 
-    @classmethod
-    def setup_task(cls, args, **kwargs):
-        """Setup the task.
-        """
-        paths = args.data.split(':')
-        assert len(paths) > 0
-        dictionary = BertDictionary.load(os.path.join(paths[0], 'dict.txt'))
-        print('| dictionary: {} types'.format(len(dictionary)))
+    def begin_epoch(self, epoch, model):
+        model.set_epoch(epoch)
 
-        return cls(args, dictionary)
-
-    def load_dataset(self, split, epoch=0, combine=False):
-        """Load a given dataset split.
-        Args:
-            split (str): name of the split (e.g., train, valid, test)
-        """
-        loaded_datasets = []
-
-        paths = self.args.data.split(':')
-        assert len(paths) > 0
-        data_path = paths[epoch % len(paths)]
-        print("| data_path", data_path)
-
-        for k in itertools.count():
-            split_k = split + (str(k) if k > 0 else '')
-            path = os.path.join(data_path, split_k)
-            ds = indexed_dataset.make_dataset(
-                path,
-                impl=self.args.dataset_impl,
-                fix_lua_indexing=True,
-                dictionary=self.dictionary,
-            )
-
-            if ds is None:
-                if k > 0:
-                    break
-                else:
-                    raise FileNotFoundError('Dataset not found: {} ({})'.format(split, data_path))
-
-            with data_utils.numpy_seed(self.seed + k):
-                loaded_datasets.append(
-                    BlockPairDataset(
-                        ds,
-                        self.dictionary,
-                        ds.sizes,
-                        self.args.tokens_per_sample,
-                        break_mode=self.args.break_mode,
-                        doc_break_size=1,
-                    )
-                )
-
-            print('| {} {} {} examples'.format(data_path, split_k, len(loaded_datasets[-1])))
-
-            if not combine:
-                break
-
-        if len(loaded_datasets) == 1:
-            dataset = loaded_datasets[0]
-            sizes = dataset.sizes
-        else:
-            dataset = ConcatDataset(loaded_datasets)
-            sizes = np.concatenate([ds.sizes for ds in loaded_datasets])
-
-        self.datasets[split] = MaskedLMDataset(
-            dataset=dataset,
-            sizes=sizes,
-            vocab=self.dictionary,
-            pad_idx=self.dictionary.pad(),
-            mask_idx=self.dictionary.mask(),
-            classif_token_idx=self.dictionary.cls(),
-            sep_token_idx=self.dictionary.sep(),
-            shuffle=self.args.shuffle_dataset,
-            seed=self.seed,
-        )
+    def max_positions(self):
+        return self.cfg.tokens_per_sample
